@@ -1,9 +1,3 @@
-"""
-@license:      Donated under Volatility Foundation, Inc. Individual Contributor Licensing Agreement
-@authors:      Kartik N. Iyer | Parag H. Rughani 
-@contact:      kartikiyerr23@proton.me | parag.rughani@gmail.com
-"""
-
 import logging
 import pefile
 from capstone import Cs, CS_ARCH_X86, CS_MODE_64, CS_MODE_32
@@ -351,7 +345,7 @@ class TLSCheck(interfaces.plugins.PluginInterface):
     #             DETECTING SUSPICIONS                            
     #-----------------------------------------------
 
-    def match_instruction_patterns(self, instructions, custom_regex=None):
+    def match_instruction_patterns(self, instructions, pe=None, custom_regex=None):
         class InstructionContext:
             def __init__(self, instruction, index, instructions):
                 self.instruction = instruction
@@ -372,237 +366,529 @@ class TLSCheck(interfaces.plugins.PluginInterface):
                         return i + 1
                 return current_idx
 
+        def detect_api_hashing(ctx):
+            """Detect potential API hashing techniques used to obscure imports."""
+            if not ctx.prev or not ctx.next:
+                return False
+
+            # Look for more specific hash calculation patterns
+            # XOR/ROL/ROR operations followed by complex call/jmp patterns
+            hashing_sequence = (
+                ctx.prev and ctx.prev.mnemonic in ('xor', 'rol', 'ror', 'add', 'mul') and
+                ctx.instruction.mnemonic in ('call', 'jmp') and
+                '[' in ctx.instruction.op_str and
+                not ('rip' in ctx.instruction.op_str)  # Exclude simple rip-relative calls
+            )
+
+            # More complex hashing sequence with multiple operations
+            if not hashing_sequence and ctx.prev and ctx.prev2:
+                # Look for hash calculation sequence: multiple arithmetic ops followed by call
+                arithmetic_ops = ('xor', 'rol', 'ror', 'add', 'mul', 'sub', 'shl', 'shr')
+                hashing_sequence = (
+                    ctx.prev2.mnemonic in arithmetic_ops and
+                    ctx.prev.mnemonic in arithmetic_ops and
+                    ctx.instruction.mnemonic in ('call', 'jmp') and
+                    not ctx.instruction.op_str.startswith('0x')  # Not a direct address
+                )
+
+            return hashing_sequence
+
+        def calculate_crc32(api_name):
+            """Calculate CRC32 hash for a given API name."""
+            import zlib
+            return zlib.crc32(api_name.encode()) & 0xFFFFFFFF
+
+        def resolve_hashed_api(pe, target_hash):
+            """Resolve a hashed API name from the DLL export table."""
+            if not pe or not hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+                return None
+
+            for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                api_name = exp.name.decode() if exp.name else f"Ordinal_{exp.ordinal}"
+                api_hash = calculate_crc32(api_name)
+                if api_hash == target_hash:
+                    return api_name
+            return None
+
         def is_tls_callback_context(ctx):
-            """Detect if we're in a TLS callback context"""
+            """Detect if we're in a TLS callback context with much higher accuracy"""
             if not ctx.prev2 or not ctx.prev:
                 return False
                 
-            # Look for TLS callback patterns
+            # Get full context - we need to analyze multiple instructions
             prev2_text = f"{ctx.prev2.mnemonic} {ctx.prev2.op_str}".lower()
             prev_text = f"{ctx.prev.mnemonic} {ctx.prev.op_str}".lower()
-            
-            return (
-                # Common TLS callback start patterns
-                (prev2_text.startswith('cmp') and 'edx' in prev2_text and
-                 prev_text.startswith(('je', 'jne'))) or
-                # Check for gs:[0x58] access (TEB access)
-                ('gs:[0x58]' in prev_text) or
-                # Look for TLS reason code checks
-                (prev2_text.startswith('cmp') and '2' in prev2_text)
-            )
-
-        def is_legitimate_memory_context(ctx):
-            """Check if memory access is in a legitimate context"""
             curr_text = ctx.full_text.lower()
             
-            # Skip if in TLS callback
-            if is_tls_callback_context(ctx):
-                return True
+            # Build a complete context string for pattern matching
+            context_text = f"{prev2_text} | {prev_text} | {curr_text}"
+            
+            # Define specific patterns for TLS callback detection
+            tls_patterns = [
+                # TLS reason code check (most reliable)
+                r"cmp\s+edx,\s+(1|2|3).*jne",
                 
-            # Check for legitimate memory access patterns
-            legitimate_patterns = [
-                # Standard string operations
-                lambda t: any(x in t for x in ['movs', 'cmps', 'scas', 'stos']),
-                # Array indexing with known offsets
-                lambda t: re.match(r'mov.*\[(e|r)[abcd]x\s*\+\s*(e|r)[abcd]x\s*\*\s*[1248]\s*\+\s*[0-9a-fx]+\]', t),
-                # Structured exception handling
-                lambda t: 'fs:[0x0]' in t or 'fs:[0x30]' in t,
-                # Stack frame access
-                lambda t: re.search(r'\[(e|r)bp\s*[+-]\s*[0-9a-fx]+\]', t)
+                # TEB access with specific TLS patterns
+                r"mov\s+.*gs:\[0x58\].*mov\s+r.d,\s+0x64",
+                
+                # Common TLS structure access pattern
+                r"cmp\s+byte\s+ptr\s+\[.*\],\s+1.*je",
+                
+                # Thread data storage pattern specific to TLS
+                r"gs:\[0x58\].*\[.*\+.*\*8\]",
             ]
             
-            return any(pattern(curr_text) for pattern in legitimate_patterns)
-
-        def is_legitimate_control_flow(ctx):
-            """Check if control flow modification is legitimate"""
-            curr_text = ctx.full_text.lower()
-            
-            # Function return checks
-            if curr_text.startswith('ret'):
-                # Verify we're at the end of a function
-                if ctx.prev and ctx.prev.mnemonic.startswith(('pop', 'leave')):
+            for pattern in tls_patterns:
+                if re.search(pattern, context_text):
                     return True
                     
-            # Indirect calls/jumps
-            if curr_text.startswith(('call', 'jmp')):
-                # Check if it's a jump table implementation
-                if ctx.prev and 'lea' in f"{ctx.prev.mnemonic} {ctx.prev.op_str}".lower():
-                    return True
-                # Check if it's a virtual function call
-                if re.search(r'(call|jmp)\s+qword\s+ptr\s+\[(e|r)[abcd]x\s*\+\s*[0-9a-fx]+\]', curr_text):
-                    return True
-                    
+            # Check for TLS initialization pattern
+            if ("cmp" in prev2_text and 
+                ("edx, 1" in prev2_text or "edx, 2" in prev2_text or "edx, 3" in prev2_text) and
+                "jne" in prev_text):
+                return True
+                
+            # More specific TEB access pattern that's common in TLS callbacks
+            if "gs:[0x58]" in context_text and "mov" in prev_text and re.search(r"jmp|je|jne", curr_text):
+                return True
+                
             return False
 
+        def is_suspicious_memory_access(ctx):
+            """Check if memory access is suspicious"""
+            curr_text = ctx.full_text.lower()
+            
+            # Skip if in TLS callback context - this is expected
+            if is_tls_callback_context(ctx):
+                return False
+                
+            # Check for suspicious memory access patterns
+            suspicious_patterns = [
+                # Self-modifying code patterns - more specific
+                lambda t: re.search(r'mov\s+byte\s+ptr\s+\[(e|r)ip.*\],\s+[^\]]+', t),
+                
+                # Writing specific opcodes that might indicate shellcode
+                lambda t: re.search(r'mov.*\[.*\],\s*(0x90|0xcc|0xcd20|0xfeeb)', t),
+                
+                # Non-standard TEB access outside expected context
+                lambda t: 'fs:[' in t and not any(addr in t for addr in ['0x30', '0x18', '0x0', '0x58']),
+                
+                # Stack spray patterns
+                lambda t: re.search(r'mov\s+dword\s+ptr\s+\[(e|r)sp\s*\+\s*(e|r).*\],\s+0x[0-9a-f]{8}', t) and 
+                          not re.search(r'mov\s+dword\s+ptr\s+\[(e|r)bp', t)
+            ]
+            
+            # Exclude common legitimate patterns
+            legitimate_patterns = [
+                # Standard stack frame setup
+                r"mov\s+\[rsp.*\],\s+r(bx|bp|di)",
+                # String operation setup
+                r"mov\s+byte\s+ptr\s+\[r(di|si|cx).*\]"
+            ]
+            
+            for pattern in legitimate_patterns:
+                if re.search(pattern, curr_text):
+                    return False
+                    
+            return any(pattern(curr_text) for pattern in suspicious_patterns)
+
+        def is_suspicious_control_flow(ctx):
+            """Check if control flow modification is suspicious with better accuracy"""
+            curr_text = ctx.full_text.lower()
+            
+            # Standard return from function is not suspicious
+            if ctx.instruction.mnemonic == 'ret':
+                # Skip flagging standard returns
+                if ctx.prev and (
+                    ctx.prev.mnemonic in ('pop', 'leave') or
+                    (ctx.prev.mnemonic == 'add' and 'rsp' in ctx.prev.op_str) or
+                    (ctx.prev.mnemonic == 'jne' and ctx.index > 0)  # Conditional return is normal
+                ):
+                    return False
+                    
+                # If there's nothing before the return, don't flag
+                if not ctx.prev:
+                    return False
+                    
+                # Check if this is an early return pattern (common in error handling)
+                if ctx.prev and ctx.prev.mnemonic in ('xor', 'mov') and 'eax' in ctx.prev.op_str:
+                    return False
+                    
+                # Only suspicious if it's an unexpected return
+                return True
+                
+            # Indirect calls/jumps with suspicious patterns
+            if ctx.instruction.mnemonic in ('call', 'jmp'):
+                # JMP/CALL to register value without table context
+                if re.match(r'(call|jmp)\s+(e|r)[abcdsi][xip]', curr_text):
+                    # Check if we have a table index setup before this
+                    if not (ctx.prev and 'lea' in f"{ctx.prev.mnemonic} {ctx.prev.op_str}".lower()):
+                        return True
+                
+                # Suspicious memory location jumps
+                if "[" in ctx.instruction.op_str:
+                    # Skip well-known patterns like virtual function calls
+                    if re.search(r'\[(e|r)[abcdsi][xip]\s*\+\s*(0x)?[0-9a-f]+\]', ctx.instruction.op_str):
+                        return False
+                        
+                    # Skip import table calls
+                    if "rip" in ctx.instruction.op_str:
+                        return False
+                        
+                    # Flag other indirect jumps
+                    if "*" in ctx.instruction.op_str or "+" in ctx.instruction.op_str:
+                        return True
+            
+            return False
+
+        def detect_stack_string_construction(ctx):
+            """Detect stack string construction techniques"""
+            if not ctx.prev or not ctx.next:
+                return False
+                
+            curr_text = ctx.full_text.lower()
+            prev_text = f"{ctx.prev.mnemonic} {ctx.prev.op_str}".lower()
+            
+            # Check for consecutive push/mov patterns that construct strings
+            
+            # Pattern 1: Direct push of ASCII/UTF values
+            if (ctx.instruction.mnemonic == 'push' and 
+                ctx.prev.mnemonic == 'push' and
+                re.match(r'push\s+(0x[0-9a-f]{2,8}|\'.\')$', curr_text)):
+                
+                # Try to extract printable characters from push value
+                try:
+                    if ctx.instruction.op_str.startswith('0x'):
+                        value = int(ctx.instruction.op_str, 16)
+                        # Convert to bytes in little-endian and check for printable chars
+                        bytes_val = value.to_bytes((value.bit_length() + 7) // 8, 'little')
+                        if any(chr(b).isprintable() and chr(b) not in '\x00\xff' for b in bytes_val):
+                            return True
+                except (ValueError, OverflowError):
+                    pass
+            
+            # Pattern 2: Byte-by-byte construction with mov
+            if (ctx.instruction.mnemonic == 'mov' and 'byte ptr' in curr_text and
+                ctx.prev.mnemonic == 'mov' and 'byte ptr' in prev_text):
+                
+                # Extract offsets to detect sequential byte writes
+                curr_offset_match = re.search(r'\[(r[bs]p|esp|ebp)([+-]0x[0-9a-f]+)\]', curr_text)
+                prev_offset_match = re.search(r'\[(r[bs]p|esp|ebp)([+-]0x[0-9a-f]+)\]', prev_text)
+                
+                if curr_offset_match and prev_offset_match:
+                    # Check if using same base register
+                    if curr_offset_match.group(1) == prev_offset_match.group(1):
+                        curr_offset = int(curr_offset_match.group(2), 16) if curr_offset_match.group(2).startswith('+') else int(curr_offset_match.group(2), 16)
+                        prev_offset = int(prev_offset_match.group(2), 16) if prev_offset_match.group(2).startswith('+') else int(prev_offset_match.group(2), 16)
+                        
+                        # Look for sequential or nearby offsets (allow small gaps)
+                        if abs(curr_offset - prev_offset) <= 4:
+                            # Check if immediate values are printable ASCII
+                            value_match = re.search(r',\s*(0x[0-9a-f]+|\'.\')(\s|$)', curr_text)
+                            if value_match:
+                                value = value_match.group(1)
+                                if value.startswith("'"):  # Character literal
+                                    return True
+                                else:
+                                    try:
+                                        byte_val = int(value, 16) & 0xFF
+                                        if byte_val >= 0x20 and byte_val <= 0x7E:  # Printable ASCII
+                                            return True
+                                    except ValueError:
+                                        pass
+            
+            # Pattern 3: Stack string constructed with xor obfuscation
+            if (ctx.instruction.mnemonic == 'xor' and 
+                'byte ptr' in curr_text and 
+                re.match(r'xor\s+byte\s+ptr\s+\[(r[bs]p|esp|ebp)([+-]0x[0-9a-f]+)\]', curr_text) and
+                ctx.prev.mnemonic in ('mov', 'xor') and 
+                'byte ptr' in prev_text):
+                
+                # Check that we're working with the same region of stack memory
+                curr_offset_match = re.search(r'\[(r[bs]p|esp|ebp)([+-]0x[0-9a-f]+)\]', curr_text)
+                prev_offset_match = re.search(r'\[(r[bs]p|esp|ebp)([+-]0x[0-9a-f]+)\]', prev_text)
+                
+                if curr_offset_match and prev_offset_match:
+                    if curr_offset_match.group(1) == prev_offset_match.group(1):
+                        return True
+            
+            return False
+            
         def detect_nop_sled(instructions, start_idx, min_length=5):
-            """Detect NOP sleds and other padding instructions used for exploit payload alignment"""
+            """Detect NOP sleds with improved accuracy, excluding function alignment NOPs"""
             nop_equivalents = {
                 'nop',
                 'xchg eax, eax',
                 'mov edi, edi',
                 'lea nop',
-                'data16 nop'
+                'data16 nop',
+                'nop dword ptr [rax]' 
             }
             
+            # First check: is this part of a function alignment sequence?
+            # Look backward for a ret instruction
+            i = start_idx - 1
+            found_ret = False
+            while i >= 0 and i >= start_idx - 10:  # Look up to 10 instructions back
+                if instructions[i].mnemonic == 'ret':
+                    found_ret = True
+                    break
+                i -= 1
+            
+            # If we found a ret before this NOP sequence, look ahead for a function prologue
+            if found_ret:
+                # Count how many NOPs we have
+                nop_count = 0
+                i = start_idx
+                while i < len(instructions):
+                    instr = instructions[i]
+                    instr_text = f"{instr.mnemonic} {instr.op_str}".lower()
+                    
+                    if instr.mnemonic == 'nop' or instr_text in nop_equivalents:
+                        nop_count += 1
+                        i += 1
+                    else:
+                        break
+                
+                # Check if the next instruction after NOPs looks like a function prologue
+                if i < len(instructions):
+                    if instructions[i].mnemonic == 'push' and instructions[i].op_str in ('rbp', 'ebp', 'rsi', 'rbx', 'rdi', 'r15'):
+                        # This is almost certainly alignment padding between functions
+                        return False
+            
+            # Regular NOP sled detection
             count = 0
             idx = start_idx
+            max_length = len(instructions) - start_idx
             
             while idx < len(instructions):
                 instr = instructions[idx]
-                if (f"{instr.mnemonic} {instr.op_str}".lower() in nop_equivalents or
-                    instr.mnemonic == 'nop'):
+                instr_text = f"{instr.mnemonic} {instr.op_str}".lower()
+                
+                if instr.mnemonic == 'ret' or instr.mnemonic == 'jmp':
+                    break
+                    
+                if instr.mnemonic == 'nop' or instr_text in nop_equivalents:
                     count += 1
                 else:
                     break
-                idx += 1
-                
-            return count >= min_length
-
-        def detect_stack_string(ctx, window_size=5):
-            """Detect stack string construction - common in obfuscated malware"""
-            if not ctx.prev or not ctx.next:
-                return False
-                
-            push_count = 0
-            for i in range(max(0, ctx.index - window_size), min(len(instructions), ctx.index + window_size)):
-                instr = instructions[i]
-                if instr.mnemonic == 'push' and any(x in instr.op_str for x in ['0x', 'h']):
-                    push_count += 1
                     
-            return push_count >= 3
-
-        def detect_api_hashing(ctx):
-            """Detect potential API hashing techniques used to obscure imports"""
-            if not ctx.prev or not ctx.next:
-                return False
-                
-            # Look for patterns like: xor/rol/ror operations followed by function pointer dereferencing
-            hashing_sequence = (
-                ctx.prev and ctx.prev.mnemonic in ('xor', 'rol', 'ror') and
-                ctx.instruction.mnemonic in ('call', 'jmp') and
-                '[' in ctx.instruction.op_str
-            )
+                idx += 1
             
-            return hashing_sequence
+            # Use a more aggressive threshold for actual malicious NOP sleds
+            if count >= min_length:
+                # For alignment NOPs that weren't caught by the previous checks,
+                # use size and context to determine suspiciousness
+                
+                # Check if this might be just standard alignment padding
+                # that wasn't caught by the function boundary detection
+                if count <= 16:  # Standard alignment is usually 16 bytes or less
+                    # For small NOP sequences, require that they make up a significant portion
+                    # of the visible code to be considered suspicious
+                    if count <= max_length * 0.5:
+                        return False
+                
+                return True
+            
+            return False
 
-        def analyze_instruction(ctx):
-            """Enhanced instruction analysis with better context awareness and additional checks"""
+        def detect_anti_debugging_checks(ctx):
+            """Detect common anti-debugging techniques with context analysis."""
             curr_text = ctx.full_text.lower()
-            
-            # Skip legitimate contexts
-            if is_legitimate_memory_context(ctx) or is_legitimate_control_flow(ctx):
-                return None
+            prev_text = f"{ctx.prev.mnemonic} {ctx.prev.op_str}".lower() if ctx.prev else ""
+            next_text = f"{ctx.next.mnemonic} {ctx.next.op_str}".lower() if ctx.next else ""
 
-            # Enhanced suspicious pattern detection
-            suspicious_patterns = [
-                # Existing patterns
-                (r'mov.*\[(e|r)[abcd]x\s*\+\s*(e|r)[abcd]x\]', 
-                 'Suspicious dynamic memory access',
-                 lambda ctx: not is_legitimate_memory_context(ctx)),
-                
-                (r'(call|jmp)\s+(e|r)[abcd]x',
-                 'Direct register control flow',
-                 lambda ctx: not is_legitimate_control_flow(ctx)),
-                
-                (r'(add|sub)\s+(esp|rsp),\s*0x[0-9a-f]{3,}',
-                 'Large stack adjustment',
-                 lambda ctx: int(re.search(r'0x([0-9a-f]+)', curr_text).group(1), 16) > 0x1000),
-                
-                # New patterns for additional suspicious activities
-                (r'int\s+3',
-                 'Debugger detection (int 3)',
-                 lambda ctx: True),
-                
-                (r'(in|out)\s+',
-                 'Direct port access',
-                 lambda ctx: True),
-                
-                (r'pushf|popf',
-                 'Flag register manipulation',
-                 lambda ctx: not is_legitimate_control_flow(ctx)),
-                
-                (r'(str|sldt|sgdt|sidt|smsw)',
-                 'System table register access',
-                 lambda ctx: True),
-                
-                (r'(rdtsc|rdtscp|rdrand|rdseed)',
-                 'Hardware-based anti-debug/VM detection',
-                 lambda ctx: True),
-                
-                (r'(aaa|aad|aam|aas|daa|das)',
-                 'Rare arithmetic instructions (possible obfuscation)',
-                 lambda ctx: True),
-                
-                (r'(fld|fst|fstp)\s+',
-                 'FPU instructions in non-math context',
-                 lambda ctx: not any(x in curr_text for x in ['float', 'double', 'real'])),
-                
-                (r'(prefetch|prefetchw|prefetchnta)',
-                 'Cache manipulation instructions',
-                 lambda ctx: True),
-                
-                (r'(lock|rep|repe|repne|repz|repnz)\s+',
-                 'Instruction prefix abuse',
-                 lambda ctx: not any(x in curr_text for x in ['movs', 'stos', 'cmps', 'scas'])),
-                
-                (r'(and|or|xor)\s+byte\s+ptr',
-                 'Byte-level manipulation of memory',
-                 lambda ctx: not is_legitimate_memory_context(ctx)),
-                
-                (r'(shl|shr|rol|ror)\s+.*,\s*cl',
-                 'Dynamic bit shifting',
-                 lambda ctx: True)
-            ]
+            # 1. Detect IsDebuggerPresent checks (even without conditional jumps)
+            if "call" in curr_text and "isdebuggerpresent" in curr_text:
+                return "IsDebuggerPresent check"
 
-            results = []
-            
-            # Check all suspicious patterns
-            for pattern, description, condition in suspicious_patterns:
-                if re.search(pattern, curr_text) and condition(ctx):
-                    results.append(f"{curr_text} - {description}")
-            
-            # Check for NOP sled
-            if detect_nop_sled(instructions, ctx.index):
-                results.append(f"NOP sled detected starting at: {curr_text}")
-            
-            # Check for stack string construction
-            if detect_stack_string(ctx):
-                results.append(f"Possible stack string construction at: {curr_text}")
-            
-            # Check for API hashing
-            if detect_api_hashing(ctx):
-                results.append(f"Possible API hashing technique at: {curr_text}")
+            # 2. Detect int3 (software breakpoint) usage
+            if "int3" in curr_text or "int 3" in curr_text:
+                # Check if this is part of a larger anti-debugging routine
+                if ctx.prev and "mov" in prev_text and "rbp" in prev_text:
+                    return "int3 (software breakpoint) usage in anti-debugging routine"
 
-            return results[0] if results else None
+            # 3. Detect TLS callback reason code checks
+            if "cmp" in curr_text and ("1" in curr_text or "2" in curr_text or "3" in curr_text):
+                # Check if this is part of a TLS callback
+                if ctx.next and ctx.next.mnemonic in ('je', 'jne', 'jz', 'jnz'):
+                    return "TLS callback anti-debugging check (reason code)"
+
+            # 4. Detect NtQueryInformationProcess checks (anti-debugging via ProcessDebugPort)
+            if "call" in curr_text and "ntqueryinformationprocess" in curr_text:
+                # Check if the ProcessDebugPort (0x7) is being queried
+                if ctx.prev and "mov" in prev_text and "0x7" in prev_text:
+                    return "NtQueryInformationProcess (ProcessDebugPort) check"
+
+            # 5. Detect CheckRemoteDebuggerPresent checks
+            if "call" in curr_text and "checkremotedebuggerpresent" in curr_text:
+                return "CheckRemoteDebuggerPresent check"
+
+            # 6. Detect DebugObjectHandle checks (anti-debugging via ProcessDebugObjectHandle)
+            if "call" in curr_text and "ntqueryinformationprocess" in curr_text:
+                # Check if the ProcessDebugObjectHandle (0x1E) is being queried
+                if ctx.prev and "mov" in prev_text and "0x1e" in prev_text:
+                    return "NtQueryInformationProcess (ProcessDebugObjectHandle) check"
+
+            # 7. Detect TEB access for anti-debugging (e.g., checking BeingDebugged flag)
+            if "gs:" in curr_text or "fs:" in curr_text:
+                # Check if accessing the BeingDebugged flag (offset 0x30 in TEB)
+                if "0x30" in curr_text and ("mov" in curr_text or "cmp" in curr_text):
+                    return "TEB access (BeingDebugged flag) for anti-debugging"
+
+            # 8. Detect self-modifying code (common in anti-debugging routines)
+            if "mov" in curr_text and "byte ptr" in curr_text and "[" in curr_text:
+                # Check if writing to code sections
+                if ctx.next and "jmp" in next_text:
+                    return "Self-modifying code (anti-debugging)"
+
+            # 9. Detect timing-based anti-debugging (e.g., RDTSC)
+            if "rdtsc" in curr_text:
+                # Check if the result is used in a suspicious way
+                if ctx.next and "cmp" in next_text:
+                    return "Timing-based anti-debugging (RDTSC)"
+
+            # 10. Detect API hooking checks (e.g., checking for hooked functions)
+            if "call" in curr_text and "getprocaddress" in curr_text:
+                # Check if the result is compared or used in a suspicious way
+                if ctx.next and "cmp" in next_text:
+                    return "API hooking check (GetProcAddress)"
+
+            return None
 
         results = {
             'suspicious_instructions': [],
-            'detection_context': {}
+            'detection_context': {},
+            'custom_matched_instructions': []
         }
 
         # Analyze each instruction
+        string_construction_start = None
+        nop_sled_detected = False
         for idx, instruction in enumerate(instructions):
             ctx = InstructionContext(instruction, idx, instructions)
-            
-            # Main analysis
-            result = analyze_instruction(ctx)
-            if result:
-                # Store additional context for analysis
-                results['detection_context'][idx] = {
-                    'is_tls_callback': is_tls_callback_context(ctx),
-                    'is_legitimate_memory': is_legitimate_memory_context(ctx),
-                    'is_legitimate_control_flow': is_legitimate_control_flow(ctx),
-                    'instruction_block_start': ctx.block_start
-                }
-                results['suspicious_instructions'].append(result)
-            
-            # Custom regex matching with context
+
+            # 1. Detect API hashing
+            if detect_api_hashing(ctx):
+                # Extract the target hash (if available)
+                target_hash = None
+                if ctx.prev and ctx.prev.mnemonic in ('xor', 'rol', 'ror', 'add', 'mul'):
+                    # Attempt to extract the hash value from the previous instruction
+                    if ctx.prev.op_str.startswith('0x'):
+                        try:
+                            target_hash = int(ctx.prev.op_str.split(',')[-1].strip(), 16)
+                        except ValueError:
+                            try:
+                                target_hash = int(ctx.prev.op_str, 16)
+                            except ValueError:
+                                pass
+
+                if target_hash and pe:
+                    # Resolve the hashed API
+                    api_name = resolve_hashed_api(pe, target_hash)
+                    if api_name:
+                        results['suspicious_instructions'].append(
+                            f"API Hashing Detected: Resolved hash {hex(target_hash)} to {api_name}"
+                        )
+                    else:
+                        results['suspicious_instructions'].append(
+                            f"API Hashing Detected: Unresolved hash {hex(target_hash)}"
+                        )
+                else:
+                    results['suspicious_instructions'].append(
+                        "API Hashing Detected: Unable to extract hash value"
+                    )
+
+            # 2. Add the stack string detection check
+            if detect_stack_string_construction(ctx):
+                # Start or continue tracking string construction sequence
+                if string_construction_start is None:
+                    string_construction_start = idx - 1  # Include previous instruction
+                
+                # If we've accumulated enough instructions, it's likely a stack string
+                if idx - string_construction_start >= 3:
+                    # Report only the beginning of the sequence to avoid too many alerts
+                    if idx - string_construction_start == 3:
+                        results['suspicious_instructions'].append(
+                            f"Stack String Construction Detected: {ctx.full_text}"
+                        )
+                        if 'obfuscation_techniques' not in results['detection_context']:
+                            results['detection_context']['obfuscation_techniques'] = []
+                        results['detection_context']['obfuscation_techniques'].append('stack_string')
+            else:
+                # Reset tracking if the pattern breaks
+                string_construction_start = None
+
+            # 3. Detect TLS callback patterns
+            if is_tls_callback_context(ctx):
+                # Only report the initial TLS check, not all instructions in the callback
+                if ctx.instruction.mnemonic == 'cmp' and 'edx' in ctx.instruction.op_str:
+                    results['suspicious_instructions'].append(
+                        f"TLS Callback Entry Point: {ctx.full_text}"
+                    )
+                    results['detection_context']['tls_callback'] = True
+
+            # 4. Detect suspicious memory access
+            if is_suspicious_memory_access(ctx):
+                results['suspicious_instructions'].append(
+                    f"Suspicious Memory Access: {ctx.full_text}"
+                )
+
+            # 5. Detect suspicious control flow
+            if is_suspicious_control_flow(ctx):
+                # For returns, provide more context
+                if ctx.instruction.mnemonic == 'ret':
+                    # # Look at previous instruction to provide context
+                    # prev_context = "unknown context"
+                    # if ctx.prev:
+                    #     prev_context = f"{ctx.prev.mnemonic} {ctx.prev.op_str}"
+                    
+                    # results['suspicious_instructions'].append(
+                    #     f"Unusual Return Instruction: {ctx.full_text} (after {prev_context})"
+                    # )
+                    pass
+                else:
+                    results['suspicious_instructions'].append(
+                        f"Suspicious Control Flow: {ctx.full_text}"
+                    )
+
+            # 6. Detect NOP sleds (only check once)
+            if not nop_sled_detected and detect_nop_sled(instructions, idx):
+                nop_sled_detected = True
+                # Count consecutive NOPs for reporting
+                count = 0
+                for i in range(idx, len(instructions)):
+                    if instructions[i].mnemonic == 'nop':
+                        count += 1
+                    else:
+                        break
+                        
+                results['suspicious_instructions'].append(
+                    f"NOP Sled Detected: {count} consecutive NOPs at offset {idx}"
+                )
+
+            # 7. Custom regex matching with context
             if custom_regex:
                 try:
                     if re.search(custom_regex, ctx.full_text, re.IGNORECASE):
-                        # Only add if not in legitimate context
-                        if not is_tls_callback_context(ctx) and not is_legitimate_memory_context(ctx):
-                            results['suspicious_instructions'].append(f"Custom match: {ctx.full_text}")
+                        match = f"Custom match: {ctx.full_text}"
+                        results['custom_matched_instructions'].append(match)
+                except re.error:
+                    vollog.error(f"Invalid regex pattern: {custom_regex}")
+
+            # 8. Detect anti-debugging checks
+            anti_debug_result = detect_anti_debugging_checks(ctx)
+            if anti_debug_result:
+                results['suspicious_instructions'].append(
+                    f"Anti-Debugging Detected: {anti_debug_result} at {hex(ctx.instruction.address)}"
+                )
+
+            # Custom regex matching (if provided)
+            if custom_regex:
+                try:
+                    if re.search(custom_regex, ctx.full_text, re.IGNORECASE):
+                        match = f"Custom match: {ctx.full_text}"
+                        results['custom_matched_instructions'].append(match)
                 except re.error:
                     vollog.error(f"Invalid regex pattern: {custom_regex}")
 
@@ -837,18 +1123,40 @@ class TLSCheck(interfaces.plugins.PluginInterface):
                 current_address = address
                 
                 print("Disassembly:")
+                collected_instructions = []
                 for insn in disassembler.disasm(code_bytes, rva_address):
                     if insn.mnemonic == 'ret' and bytes_to_disassemble == 64:
                         print(f"{hex(current_address)}:\t{green}{insn.mnemonic}{disable}\t{insn.op_str}")
+                        collected_instructions.append(insn)
                         break
-                    print(f"{hex(current_address)}:\t{green}{insn.mnemonic}{disable}\t{insn.op_str}")
+
+                    # API Resolution for 32-bit
+                    if insn.mnemonic == 'call' or insn.mnemonic == 'jmp':
+                        target_address = None
+                        if 'dword ptr' in insn.op_str:
+                            # Extract the address from the operand
+                            target_address = int(insn.op_str.split('[')[1].split(']')[0], 16)
+                        elif insn.op_str.startswith('0x'):
+                            target_address = int(insn.op_str, 16)
+
+                        if target_address:
+                            # Resolve the API name from the IAT
+                            api_name = self.resolve_api_from_iat(pe, target_address)
+                            if api_name:
+                                print(f"{hex(current_address)}:\t{green}{insn.mnemonic}{disable}\t{insn.op_str} \t{blue}[API: {api_name}]{disable}")
+                            else:
+                                print(f"{hex(current_address)}:\t{green}{insn.mnemonic}{disable}\t{insn.op_str}")
+                        else:
+                            print(f"{hex(current_address)}:\t{green}{insn.mnemonic}{disable}\t{insn.op_str}")
+                    else:
+                        print(f"{hex(current_address)}:\t{green}{insn.mnemonic}{disable}\t{insn.op_str}")
+
+                    collected_instructions.append(insn)
                     current_address += insn.size
 
-                # Existing suspicious instruction detection
-                detection_results = self.match_instruction_patterns(
-                    list(disassembler.disasm(code_bytes, rva_address)), 
-                    custom_regex
-                )
+                # Detect API hashing and suspicious instructions
+                # Detect API hashing and suspicious instructions
+                detection_results = self.match_instruction_patterns(collected_instructions, pe, custom_regex)
                 
                 if show_suspicious and detection_results['suspicious_instructions']:
                     print("----------------------------------------------------------------")
@@ -879,6 +1187,7 @@ class TLSCheck(interfaces.plugins.PluginInterface):
         except Exception as e:
             vollog.error(f"[ERROR] Disassembly error: {str(e)}")
 
+
     #-----------------------------------------------
     #            DISASSEMBLER FOR 64-BIT                             
     #-----------------------------------------------
@@ -904,7 +1213,7 @@ class TLSCheck(interfaces.plugins.PluginInterface):
                 offset = self.rva_to_file_offset(pe, rva_address)
                 
                 if offset is None:
-                    vollog.error("[ERROR] Could not convert RVA to offset for disassembly.")
+                    vollog.error(f"[ERROR] Could not convert RVA to offset for disassembly at address {hex(address)}.")
                     return
 
                 f.seek(offset)
@@ -912,7 +1221,7 @@ class TLSCheck(interfaces.plugins.PluginInterface):
                 
                 # Print process information
                 print("\n\n----------------------------------------------------------------")
-                print(f"{cyan}TLS-Callback Found in Process: {proc_name} (PID: {pid}){disable}")
+                print(f"{cyan}Disassembling code at address: {hex(address)} for Process: {proc_name} (PID: {pid}){disable}")
                 print(f"Address range: {hex(address)} - {hex(address + (bytes_to_disassemble or 256))}")
                 print("----------------------------------------------------------------")
                 
@@ -928,23 +1237,66 @@ class TLSCheck(interfaces.plugins.PluginInterface):
                 
                 print("Disassembly:")
                 collected_instructions = []
+                call_targets = []  # To track call targets for one-level disassembly
+                
                 for insn in disassembler.disasm(code_bytes, callback_rva):
                     if insn.mnemonic == 'ret' and bytes_to_disassemble == 64:
                         print(f"{hex(current_address)}:\t{green}{insn.mnemonic}{disable}\t{insn.op_str}")
                         collected_instructions.append(insn)
                         break
-                    print(f"{hex(current_address)}:\t{green}{insn.mnemonic}{disable}\t{insn.op_str}")
+
+                    # Track calls for one-level disassembly
+                    is_call = insn.mnemonic == 'call'
+                    target_address = None
+                    api_name = None
+
+                    # Handle rip-relative addressing
+                    if 'rip +' in insn.op_str:
+                        offset_str = insn.op_str.split('rip + ')[1].split(']')[0]
+                        offset = int(offset_str, 16)
+                        target_address = current_address + insn.size + offset
+                        api_name = self.resolve_api_from_iat(pe, target_address)
+                        
+                    # Handle direct calls/jumps
+                    elif is_call or insn.mnemonic == 'jmp':
+                        if 'qword ptr' in insn.op_str:
+                            # Extract the address from the operand
+                            try:
+                                target_address = int(insn.op_str.split('[')[1].split(']')[0], 16)
+                            except:
+                                pass
+                        elif insn.op_str.startswith('0x'):
+                            # Direct address
+                            target_address = int(insn.op_str, 16)
+                            # For direct calls, adjust for relative addressing
+                            if '0x' in insn.op_str and len(insn.op_str) <= 10:  # Likely a relative offset
+                                target_address = current_address + insn.size + (target_address - (callback_rva + (current_address - address)))
+
+                        # Resolve API and track for one-level disassembly if it's a call
+                        if target_address:
+                            api_name = self.resolve_api_from_iat(pe, target_address)
+                            if is_call and not api_name:  # Only disassemble non-API calls
+                                abs_target = image_base + target_address if target_address < image_base else target_address
+                                call_targets.append(abs_target)
+
+                    # Print the current instruction with API info if available
+                    if api_name:
+                        print(f"{hex(current_address)}:\t{green}{insn.mnemonic}{disable}\t{insn.op_str} \t{blue}[API: {api_name}]{disable}")
+                    else:
+                        print(f"{hex(current_address)}:\t{green}{insn.mnemonic}{disable}\t{insn.op_str}")
+
                     collected_instructions.append(insn)
                     current_address += insn.size
 
-                # Existing suspicious instruction detection
-                detection_results = self.match_instruction_patterns(collected_instructions, custom_regex)
+                # Detect API hashing and suspicious instructions
+                # Detect API hashing and suspicious instructions
+                detection_results = self.match_instruction_patterns(collected_instructions, pe, custom_regex)
                 
                 if show_suspicious and detection_results['suspicious_instructions']:
                     print("----------------------------------------------------------------")
                     print(f"{yellow}[*] Potentially Suspicious Instruction(s) Identified:{disable}\n")
                     for susp_inst in detection_results['suspicious_instructions']:
-                        print(f"{green}[SUSPICIOUS]:{disable} {susp_inst}")
+                        print(f"{red}[SUSPICIOUS]:{disable} {susp_inst}")
                 
                 if custom_regex and detection_results.get('custom_matched_instructions'):
                     print("----------------------------------------------------------------")
@@ -962,12 +1314,192 @@ class TLSCheck(interfaces.plugins.PluginInterface):
                             print(f"{yellow}[*] YARA Rule Matches:{disable}")
                             for match in yara_matches:
                                 print(f"{red}[YARA Match] Rule: {match['rule']}{disable}")
-                                # print(f"Rule definition: {match['rule_line']}")
+                
+                print("----------------------------------------------------------------")
+
+                # Disassemble call targets (one level only)
+                for target in call_targets:
+                    print(f"\n{yellow}[+] Following call to address: {hex(target)}{disable}")
+                    # Call original disassemble function without modifying to avoid recursion
+                    self.disassemble_call_target(exe_file, target, image_base, proc_name, pid)
+
+        except Exception as e:
+            vollog.error(f"[ERROR] Disassembly error at {hex(address)}: {str(e)}")
+            import traceback
+            vollog.debug(traceback.format_exc())
+
+    # Add a new helper function to disassemble call targets without recursion
+    def disassemble_call_target(self, exe_file, address, image_base, proc_name, pid):
+        cyan = "\033[36m"
+        yellow = "\033[93m"
+        green = "\033[32m"
+        blue = "\033[34m"
+        red = "\033[31m"
+        disable = "\033[0m"
+
+        bytes_to_disassemble = self.config.get("disasm-bytes", 64)
+        custom_regex = self.config.get("regex", None)
+        show_suspicious = self.config.get("scan-suspicious", False)
+        yara_rule_path = self.config.get("yara-file", None)
+        
+        rva_address = address - image_base
+
+        try:
+            with open(exe_file, "rb") as f:
+                pe = pefile.PE(exe_file)
+                offset = self.rva_to_file_offset(pe, rva_address)
+                
+                if offset is None:
+                    vollog.error(f"[ERROR] Could not convert RVA to offset for call target at address {hex(address)}.")
+                    return
+
+                f.seek(offset)
+                code_bytes = f.read(bytes_to_disassemble or 256)
+                
+                # Print process information
+                print("\n----------------------------------------------------------------")
+                print(f"{cyan}Disassembling call target at address: {hex(address)} for Process: {proc_name} (PID: {pid}){disable}")
+                print(f"Address range: {hex(address)} - {hex(address + (bytes_to_disassemble or 256))}")
+                print("----------------------------------------------------------------")
+                
+                # Print hex dump
+                hex_dump = self.format_hex_dump(code_bytes)
+                for line in hex_dump:
+                    print(line)
+                
+                # Disassemble and print instructions
+                disassembler = Cs(CS_ARCH_X86, CS_MODE_64)
+                disassembler.detail = True
+                current_address = address
+                
+                print("Disassembly:")
+                collected_instructions = []
+                
+                for insn in disassembler.disasm(code_bytes, rva_address):
+                    if insn.mnemonic == 'ret' and bytes_to_disassemble == 64:
+                        print(f"{hex(current_address)}:\t{green}{insn.mnemonic}{disable}\t{insn.op_str}")
+                        collected_instructions.append(insn)
+                        break
+
+                    # Handle rip-relative addressing for API resolution
+                    api_name = None
+                    if 'rip +' in insn.op_str:
+                        offset_str = insn.op_str.split('rip + ')[1].split(']')[0]
+                        offset = int(offset_str, 16)
+                        target_address = current_address + insn.size + offset
+                        api_name = self.resolve_api_from_iat(pe, target_address)
+                        
+                    # Handle direct calls/jumps for API resolution
+                    elif insn.mnemonic == 'call' or insn.mnemonic == 'jmp':
+                        target_address = None
+                        if 'qword ptr' in insn.op_str:
+                            try:
+                                target_address = int(insn.op_str.split('[')[1].split(']')[0], 16)
+                            except:
+                                pass
+                        elif insn.op_str.startswith('0x'):
+                            target_address = int(insn.op_str, 16)
+
+                        if target_address:
+                            api_name = self.resolve_api_from_iat(pe, target_address)
+
+                    # Print the current instruction with API info if available
+                    if api_name:
+                        # print(f"{hex(current_address)}:\t{green}{insn.mnemonic}{disable}\t{insn.op_str} \t{blue}[API: {api_name}]{disable}")
+                        pass
+                    else:
+                        print(f"{hex(current_address)}:\t{green}{insn.mnemonic}{disable}\t{insn.op_str}")
+
+                    collected_instructions.append(insn)
+                    current_address += insn.size
+
+                # Detect API hashing and suspicious instructions
+                detection_results = self.match_instruction_patterns(collected_instructions, custom_regex)
+                
+                if show_suspicious and detection_results['suspicious_instructions']:
+                    print("----------------------------------------------------------------")
+                    print(f"{yellow}[*] Potentially Suspicious Instruction(s) Identified:{disable}\n")
+                    for susp_inst in detection_results['suspicious_instructions']:
+                        print(f"{red}[SUSPICIOUS]:{disable} {susp_inst}")
+                
+                if custom_regex and detection_results.get('custom_matched_instructions'):
+                    print("----------------------------------------------------------------")
+                    print(f"{yellow}[*] Found matching instruction(s):{disable}")
+                    for matched_inst in detection_results['custom_matched_instructions']:
+                        print(f"{green}[SUSPICIOUS]: {matched_inst}{disable}")
+
+                # YARA scanning
+                if yara_rule_path:
+                    rules = self.compile_yara_rules(yara_rule_path)
+                    if rules:
+                        yara_matches = self.scan_with_yara(rules, code_bytes)
+                        if yara_matches:
+                            print("----------------------------------------------------------------")
+                            print(f"{yellow}[*] YARA Rule Matches:{disable}")
+                            for match in yara_matches:
+                                print(f"{red}[YARA Match] Rule: {match['rule']}{disable}")
                 
                 print("----------------------------------------------------------------")
 
         except Exception as e:
-            vollog.error(f"[ERROR] Disassembly error: {str(e)}")
+            vollog.error(f"[ERROR] Disassembly error at call target {hex(address)}: {str(e)}")
+
+    #-----------------------------------------------
+    #              API Resolution Function                             
+    #-----------------------------------------------
+
+    def resolve_api_from_iat(self, pe, target_address):
+        """
+        Resolve API name from the Import Address Table (IAT) with enhanced support.
+        Handles regular imports, delay-loaded imports, forwarded exports, and provides fallback mechanisms.
+        """
+        if not hasattr(pe, 'DIRECTORY_ENTRY_IMPORT') and not hasattr(pe, 'DIRECTORY_ENTRY_DELAY_IMPORT'):
+            vollog.debug(f"No import table found for target address: {hex(target_address)}")
+            return None
+
+        # Helper function to resolve API name from import entries
+        def resolve_from_imports(import_entries):
+            for entry in import_entries:
+                for imp in entry.imports:
+                    if imp.address == target_address:
+                        api_name = imp.name.decode() if imp.name else f"Ordinal_{imp.ordinal}"
+                        vollog.debug(f"Resolved API: {api_name} at address {hex(target_address)}")
+                        return api_name
+            return None
+
+        # Check regular imports
+        if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
+            api_name = resolve_from_imports(pe.DIRECTORY_ENTRY_IMPORT)
+            if api_name:
+                return api_name
+
+        # Check delay-loaded imports
+        if hasattr(pe, 'DIRECTORY_ENTRY_DELAY_IMPORT'):
+            api_name = resolve_from_imports(pe.DIRECTORY_ENTRY_DELAY_IMPORT)
+            if api_name:
+                return api_name
+
+        # Check forwarded exports
+        if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+            for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                if exp.address == target_address:
+                    api_name = exp.name.decode() if exp.name else f"Ordinal_{exp.ordinal}"
+                    vollog.debug(f"Resolved forwarded export: {api_name} at address {hex(target_address)}")
+                    return api_name
+
+        # Fallback: Scan the entire address space for potential API pointers
+        for section in pe.sections:
+            section_start = section.VirtualAddress
+            section_end = section_start + section.Misc_VirtualSize
+            if section_start <= target_address < section_end:
+                # Attempt to resolve the API name based on the section's characteristics
+                vollog.debug(f"Unresolved API at address {hex(target_address)} in section {section.Name.decode().strip()}")
+                # return f"Unknown_API_{hex(target_address)}"
+                return f""
+
+        # If no match is found, return None
+        vollog.debug(f"Unable to resolve API at address: {hex(target_address)}")
+        return None
 
     def run(self):
         filter_func = pslist.PsList.create_pid_filter(self.config.get("pid", None))
